@@ -33,49 +33,93 @@ Current release info
 Installing trajopt
 ==================
 
-Installing `trajopt` from the `tesseract-robotics` channel can be achieved by adding `tesseract-robotics` to your channels with:
+Installing `trajopt` from the `tesseract-robotics/label/dev` channel can be achieved by adding `tesseract-robotics/label/dev` to your channels with:
 
 ```
-conda config --add channels tesseract-robotics
+conda config --add channels tesseract-robotics/label/dev
 conda config --set channel_priority strict
 ```
 
-Once the `tesseract-robotics` channel has been enabled, `trajopt` can be installed with `conda`:
+How to use
+----------
+
+<details>
+<summary>With conda</summary>
 
 ```
 conda install trajopt
 ```
 
-or with `mamba`:
+</details>
+
+<details>
+<summary>With mamba</summary>
 
 ```
 mamba install trajopt
 ```
 
-It is possible to list all of the versions of `trajopt` available on your platform with `conda`:
+</details>
+
+<details>
+<summary>With pixi</summary>
 
 ```
-conda search trajopt --channel tesseract-robotics
+# for adding to your local project
+pixi add trajopt
+# for installing globally
+pixi global install trajopt
 ```
 
-or with `mamba`:
+</details>
+
+Search package versions
+-----------------------
+
+It is possible to list all of the versions of `trajopt` available on your platform:
+
+<details>
+<summary>With conda</summary>
 
 ```
-mamba search trajopt --channel tesseract-robotics
+conda search trajopt --channel tesseract-robotics/label/dev
 ```
 
-Alternatively, `mamba repoquery` may provide more information:
+</details>
+
+<details>
+<summary>With mamba</summary>
+
+```
+mamba search trajopt --channel tesseract-robotics/label/dev
+```
+
+</details>
+
+<details>
+<summary>With pixi</summary>
+
+```
+pixi search trajopt --channel tesseract-robotics/label/dev
+```
+
+</details>
+
+<details>
+<summary>With mamba repoquery, which may provide more information</summary>
 
 ```
 # Search all versions available on your platform:
-mamba repoquery search trajopt --channel tesseract-robotics
+mamba repoquery search trajopt --channel tesseract-robotics/label/dev
 
 # List packages depending on `trajopt`:
-mamba repoquery whoneeds trajopt --channel tesseract-robotics
+mamba repoquery whoneeds trajopt --channel tesseract-robotics/label/dev
 
 # List dependencies of `trajopt`:
-mamba repoquery depends trajopt --channel tesseract-robotics
+mamba repoquery depends trajopt --channel tesseract-robotics/label/dev
 ```
+
+</details>
 
 
 
