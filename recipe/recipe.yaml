@@ -1,15 +1,18 @@
 schema_version: 1
 
 context:
-  version: "0.35.0"
+  # dev track: upstream main at a pinned SHA. `.dev<commit date>` sorts below the
+  # next release (0.36.0.dev20260930 < 0.36.0), so the 0.36.0 package supersedes it.
+  version: "0.36.0.dev20260930"
+  upstream_sha: "de9e941b7141012e4054bcdea2e552021a996842"
 
 package:
   name: trajopt
   version: ${{ version }}
 
 source:
-  - url: https://github.com/tesseract-robotics/trajopt/archive/refs/tags/${{ version }}.tar.gz
-    sha256: d847fe65e27c204c47c9f92d59710e57e7514defe5f8faa87aedf59d82ba6fbe
+  - url: https://github.com/tesseract-robotics/trajopt/archive/${{ upstream_sha }}.tar.gz
+    sha256: 0552d555df47abde3f72f94f3cb510ace4b28add236f8f4f20fb63bc481cd661
     file_name: source.tar.gz
 
 build:
@@ -31,7 +34,7 @@ requirements:
     - cereal
     - eigen-abi-devel
     - tinyxml2
-    - console_bridge
+    - spdlog
     - assimp
     - urdfdom
     - fcl
@@ -60,7 +63,7 @@ requirements:
     - cereal
     - eigen
     - tinyxml2
-    - console_bridge
+    - spdlog
     - assimp
     - urdfdom
     - fcl
