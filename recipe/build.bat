@@ -6,6 +6,11 @@ mkdir src
 echo */ci/*> tar_excludes.txt
 tar xf source.tar.gz --strip-components=1 -C src -X tar_excludes.txt
 
+for %%f in ("%RECIPE_DIR%\patches\*.patch") do (
+    patch -p1 --forward --no-backup-if-mismatch -d src -i "%%f"
+    if !errorlevel! neq 0 exit !errorlevel!
+)
+
 move src\trajopt_optimizers\trajopt_sqp src\trajopt_sqp
 
 REM Flags as trajopt_ext/piqp: PIQP does not install its DLL, so static on Windows.

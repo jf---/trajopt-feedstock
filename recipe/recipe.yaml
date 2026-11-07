@@ -16,12 +16,15 @@ source:
   - url: https://github.com/tesseract-robotics/trajopt/archive/${{ upstream_sha }}.tar.gz
     sha256: 33a3a27b679d36bb889b038b195b5bd5dc4ae82a3cf036a66941de2037d9e941
     file_name: source.tar.gz
+    # Not extracted by rattler-build (see build.sh / build.bat: the tarball's `ci` symlink is skipped on Windows),
+    # so `patches:` cannot apply here. The build scripts apply patches/*.patch to src/ in order after extracting:
+    #   0001-0004: tesseract-robotics/trajopt#606, #617, #626 (fix/ifopt-declared-members), until merged upstream.
   - url: https://github.com/PREDICT-EPFL/piqp/archive/refs/tags/v${{ piqp_version }}.tar.gz
     sha256: 8a6381e65ac8626f804c98453966aed064bced0f6a0fc1ebc9010604fae3d676
     file_name: piqp.tar.gz
 
 build:
-  number: 0
+  number: 1
 
 requirements:
   build:
@@ -33,6 +36,10 @@ requirements:
     - cmake
     - ninja
     - ros-industrial-cmake-boilerplate
+    - if: unix
+      then: patch
+    - if: win
+      then: m2-patch
     - benchmark
     - lcov
   host:

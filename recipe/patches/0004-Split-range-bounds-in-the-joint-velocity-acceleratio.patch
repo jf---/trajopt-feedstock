@@ -1,0 +1,753 @@
+From cf92e2789f32886881126a36abb9adb4b42391ef Mon Sep 17 00:00:00 2001
+From: Jelle Feringa <jelleferinga@gmail.com>
+Date: Sat, 7 Nov 2026 15:01:37 +0100
+Subject: [PATCH 4/4] Split range bounds in the joint velocity, acceleration
+ and jerk constraints
+
+The bounds constructors take the RangeBoundHandling argument that
+JointPosConstraint and CartPosConstraint have, defaulting to
+kSplitToTwoInequalities. Each range row becomes a lower-bound row followed by
+an upper-bound row; equality and one-sided rows stay single rows, so the
+bounds may mix all three per joint. A symmetric band -v <= dq <= v can then be
+a TrajOptQPProblem constraint, which rejects unsplit range rows.
+
+Each class keeps a row map from output row to difference row (timestep *
+n_dof + joint), and getValues(), getJacobian() and the coefficients follow it.
+splitRangeBounds() and selectRows() in ifopt_utils do the work for all three.
+Targets are equality bounds and never split.
+
+Refs #606
+---
+ .../joint_acceleration_constraint.h           | 20 +++--
+ .../constraints/joint_jerk_constraint.h       | 20 +++--
+ .../constraints/joint_velocity_constraint.h   | 20 +++--
+ .../include/trajopt_ifopt/utils/ifopt_utils.h | 17 ++++
+ .../joint_acceleration_constraint.cpp         | 32 ++++++--
+ .../src/constraints/joint_jerk_constraint.cpp | 32 ++++++--
+ .../constraints/joint_velocity_constraint.cpp | 32 ++++++--
+ trajopt_ifopt/src/utils/ifopt_utils.cpp       | 49 +++++++++++
+ trajopt_ifopt/test/joint_terms_unit.cpp       | 81 ++++++++++++++-----
+ .../test/joint_velocity_optimization_unit.cpp | 73 +++++++++++++++++
+ 10 files changed, 318 insertions(+), 58 deletions(-)
+
+diff --git a/trajopt_ifopt/include/trajopt_ifopt/constraints/joint_acceleration_constraint.h b/trajopt_ifopt/include/trajopt_ifopt/constraints/joint_acceleration_constraint.h
+index 3cefa909..8221504a 100644
+--- a/trajopt_ifopt/include/trajopt_ifopt/constraints/joint_acceleration_constraint.h
++++ b/trajopt_ifopt/include/trajopt_ifopt/constraints/joint_acceleration_constraint.h
+@@ -56,28 +56,35 @@ public:
+    * @param coeffs The joint coefficients to use as weights. If size of 1 then the values is replicated for each joint.
+    * If empty, every row is weighted 1.
+    * @param name Name of the constraint
++   * @param range_bound_handling Kept for symmetry with the bounds constructor; targets are equality bounds and never
++   * split
+    */
+   JointAccelConstraint(const Eigen::VectorXd& targets,
+                        const std::vector<std::shared_ptr<const Var>>& position_vars,
+                        const Eigen::VectorXd& coeffs,
+-                       std::string name = "JointAccel");
++                       std::string name = "JointAccel",
++                       RangeBoundHandling range_bound_handling = RangeBoundHandling::kSplitToTwoInequalities);
+ 
+   /**
+    * @brief Constructs an acceleration constraint from these variables, setting the bounds to those passed in.
+    * @param bounds Bounds on each joint's acceleration (length should be n_dof), repeated for every row block. The rows
+-   * are finite differences of the joint positions, not divided by a time step, so the bounds are per step. A range
+-   * bound (finite lower < upper) stays a single row, which TrajOptQPProblem does not accept; use equality or one-sided
+-   * bounds there.
++   * are finite differences of the joint positions, not divided by a time step, so the bounds are per step. Equality,
++   * one-sided and range bounds may be mixed per joint.
+    * @param position_vars Joint positions used to calculate acceleration. These vars are assumed to be continuous and in
+    * order.
+    * @param coeffs The joint coefficients to use as weights. If size of 1 then the values is replicated for each joint.
+    * If empty, every row is weighted 1.
+    * @param name Name of the constraint
++   * @param range_bound_handling With kSplitToTwoInequalities (the default), each range bound becomes a lower-bound row
++   * followed by an upper-bound row, so getValues(), getJacobian(), getBounds() and getCoefficients() have one entry
++   * per split row. Equality and one-sided bounds keep a single row. With kKeepAsIs, a range bound stays one row,
++   * which TrajOptQPProblem does not accept.
+    */
+   JointAccelConstraint(const std::vector<Bounds>& bounds,
+                        const std::vector<std::shared_ptr<const Var>>& position_vars,
+                        const Eigen::VectorXd& coeffs,
+-                       std::string name = "JointAccel");
++                       std::string name = "JointAccel",
++                       RangeBoundHandling range_bound_handling = RangeBoundHandling::kSplitToTwoInequalities);
+ 
+   /**
+    * @brief Returns the values associated with the constraint. In this case that is the approximate joint acceleration.
+@@ -115,6 +122,9 @@ private:
+ 
+   /** @brief Pointers to the vars used by this constraint. */
+   std::vector<std::shared_ptr<const Var>> position_vars_;
++
++  /** @brief For each row, the difference row (timestep * n_dof_ + joint) it evaluates. Split range rows repeat it. */
++  std::vector<Eigen::Index> row_map_;
+ };
+ }  // namespace trajopt_ifopt
+ #endif
+diff --git a/trajopt_ifopt/include/trajopt_ifopt/constraints/joint_jerk_constraint.h b/trajopt_ifopt/include/trajopt_ifopt/constraints/joint_jerk_constraint.h
+index dc7264ce..3e8fd2c4 100644
+--- a/trajopt_ifopt/include/trajopt_ifopt/constraints/joint_jerk_constraint.h
++++ b/trajopt_ifopt/include/trajopt_ifopt/constraints/joint_jerk_constraint.h
+@@ -56,28 +56,35 @@ public:
+    * @param coeffs The joint coefficients to use as weights. If size of 1 then the values is replicated for each joint.
+    * If empty, every row is weighted 1.
+    * @param name Name of the constraint
++   * @param range_bound_handling Kept for symmetry with the bounds constructor; targets are equality bounds and never
++   * split
+    */
+   JointJerkConstraint(const Eigen::VectorXd& targets,
+                       const std::vector<std::shared_ptr<const Var>>& position_vars,
+                       const Eigen::VectorXd& coeffs,
+-                      std::string name = "JointJerk");
++                      std::string name = "JointJerk",
++                      RangeBoundHandling range_bound_handling = RangeBoundHandling::kSplitToTwoInequalities);
+ 
+   /**
+    * @brief Constructs a jerk constraint from these variables, setting the bounds to those passed in.
+    * @param bounds Bounds on each joint's jerk (length should be n_dof), repeated for every row block. The rows are
+-   * finite differences of the joint positions, not divided by a time step, so the bounds are per step. A range bound
+-   * (finite lower < upper) stays a single row, which TrajOptQPProblem does not accept; use equality or one-sided
+-   * bounds there.
++   * finite differences of the joint positions, not divided by a time step, so the bounds are per step. Equality,
++   * one-sided and range bounds may be mixed per joint.
+    * @param position_vars Joint positions used to calculate jerk. These vars are assumed to be continuous and in
+    * order.
+    * @param coeffs The joint coefficients to use as weights. If size of 1 then the values is replicated for each joint.
+    * If empty, every row is weighted 1.
+    * @param name Name of the constraint
++   * @param range_bound_handling With kSplitToTwoInequalities (the default), each range bound becomes a lower-bound row
++   * followed by an upper-bound row, so getValues(), getJacobian(), getBounds() and getCoefficients() have one entry
++   * per split row. Equality and one-sided bounds keep a single row. With kKeepAsIs, a range bound stays one row,
++   * which TrajOptQPProblem does not accept.
+    */
+   JointJerkConstraint(const std::vector<Bounds>& bounds,
+                       const std::vector<std::shared_ptr<const Var>>& position_vars,
+                       const Eigen::VectorXd& coeffs,
+-                      std::string name = "JointJerk");
++                      std::string name = "JointJerk",
++                      RangeBoundHandling range_bound_handling = RangeBoundHandling::kSplitToTwoInequalities);
+ 
+   /**
+    * @brief Returns the values associated with the constraint. In this case that is the approximate joint jerk.
+@@ -115,6 +122,9 @@ private:
+ 
+   /** @brief Pointers to the vars used by this constraint. */
+   std::vector<std::shared_ptr<const Var>> position_vars_;
++
++  /** @brief For each row, the difference row (timestep * n_dof_ + joint) it evaluates. Split range rows repeat it. */
++  std::vector<Eigen::Index> row_map_;
+ };
+ }  // namespace trajopt_ifopt
+ #endif
+diff --git a/trajopt_ifopt/include/trajopt_ifopt/constraints/joint_velocity_constraint.h b/trajopt_ifopt/include/trajopt_ifopt/constraints/joint_velocity_constraint.h
+index 01497ce6..3f3cf8ee 100644
+--- a/trajopt_ifopt/include/trajopt_ifopt/constraints/joint_velocity_constraint.h
++++ b/trajopt_ifopt/include/trajopt_ifopt/constraints/joint_velocity_constraint.h
+@@ -56,28 +56,35 @@ public:
+    * @param coeffs The joint coefficients to use as weights. If size of 1 then the values is replicated for each joint.
+    * If empty, every row is weighted 1.
+    * @param name Name of the constraint
++   * @param range_bound_handling Kept for symmetry with the bounds constructor; targets are equality bounds and never
++   * split
+    */
+   JointVelConstraint(const Eigen::VectorXd& targets,
+                      const std::vector<std::shared_ptr<const Var>>& position_vars,
+                      const Eigen::VectorXd& coeffs,
+-                     std::string name = "JointVel");
++                     std::string name = "JointVel",
++                     RangeBoundHandling range_bound_handling = RangeBoundHandling::kSplitToTwoInequalities);
+ 
+   /**
+    * @brief Constructs a velocity constraint from these variables, setting the bounds to those passed in.
+    * @param bounds Bounds on each joint's velocity (length should be n_dof), repeated for every row block. The rows are
+-   * finite differences of the joint positions, not divided by a time step, so the bounds are per step. A range bound
+-   * (finite lower < upper) stays a single row, which TrajOptQPProblem does not accept; use equality or one-sided
+-   * bounds there.
++   * finite differences of the joint positions, not divided by a time step, so the bounds are per step. Equality,
++   * one-sided and range bounds may be mixed per joint.
+    * @param position_vars Joint positions used to calculate velocity. These vars are assumed to be continuous and in
+    * order.
+    * @param coeffs The joint coefficients to use as weights. If size of 1 then the values is replicated for each joint.
+    * If empty, every row is weighted 1.
+    * @param name Name of the constraint
++   * @param range_bound_handling With kSplitToTwoInequalities (the default), each range bound becomes a lower-bound row
++   * followed by an upper-bound row, so getValues(), getJacobian(), getBounds() and getCoefficients() have one entry
++   * per split row. Equality and one-sided bounds keep a single row. With kKeepAsIs, a range bound stays one row,
++   * which TrajOptQPProblem does not accept.
+    */
+   JointVelConstraint(const std::vector<Bounds>& bounds,
+                      const std::vector<std::shared_ptr<const Var>>& position_vars,
+                      const Eigen::VectorXd& coeffs,
+-                     std::string name = "JointVel");
++                     std::string name = "JointVel",
++                     RangeBoundHandling range_bound_handling = RangeBoundHandling::kSplitToTwoInequalities);
+ 
+   /**
+    * @brief Returns the values associated with the constraint. In this case that is the approximate joint velocity.
+@@ -115,6 +122,9 @@ private:
+ 
+   /** @brief Pointers to the vars used by this constraint. */
+   std::vector<std::shared_ptr<const Var>> position_vars_;
++
++  /** @brief For each row, the difference row (timestep * n_dof_ + joint) it evaluates. Split range rows repeat it. */
++  std::vector<Eigen::Index> row_map_;
+ };
+ }  // namespace trajopt_ifopt
+ #endif
+diff --git a/trajopt_ifopt/include/trajopt_ifopt/utils/ifopt_utils.h b/trajopt_ifopt/include/trajopt_ifopt/utils/ifopt_utils.h
+index d13382e3..4ef07b0b 100644
+--- a/trajopt_ifopt/include/trajopt_ifopt/utils/ifopt_utils.h
++++ b/trajopt_ifopt/include/trajopt_ifopt/utils/ifopt_utils.h
+@@ -49,6 +49,23 @@ std::vector<Bounds> toBounds(const Eigen::Ref<const Eigen::MatrixX2d>& limits);
+ std::vector<Bounds> toBounds(const Eigen::Ref<const Eigen::VectorXd>& lower_limits,
+                              const Eigen::Ref<const Eigen::VectorXd>& upper_limits);
+ 
++/**
++ * @brief Splits each range bound (finite lower < finite upper) into a lower-bound row and an upper-bound row
++ * @details Equality and one-sided bounds keep a single row. Each split row keeps the coefficient of its source row.
++ * @param bounds Bounds per row, replaced by the bounds per split row
++ * @param coeffs Coefficients per row (same size as bounds), replaced by the coefficients per split row
++ * @return For each split row, the index of the row it came from
++ */
++std::vector<Eigen::Index> splitRangeBounds(std::vector<Bounds>& bounds, Eigen::VectorXd& coeffs);
++
++/**
++ * @brief Builds a Jacobian from rows of another, in the given order; a row may repeat
++ * @param jac The source Jacobian
++ * @param rows For each output row, the row of jac it copies
++ * @return A Jacobian with rows.size() rows and the columns of jac
++ */
++Jacobian selectRows(const Jacobian& jac, const std::vector<Eigen::Index>& rows);
++
+ /**
+  * @brief Interpolates between two Eigen::VectorXds
+  * @param start Start vector. This will be the first vector in the results
+diff --git a/trajopt_ifopt/src/constraints/joint_acceleration_constraint.cpp b/trajopt_ifopt/src/constraints/joint_acceleration_constraint.cpp
+index cc496123..6d0edb94 100644
+--- a/trajopt_ifopt/src/constraints/joint_acceleration_constraint.cpp
++++ b/trajopt_ifopt/src/constraints/joint_acceleration_constraint.cpp
+@@ -29,6 +29,7 @@
+ 
+ TRAJOPT_IGNORE_WARNINGS_PUSH
+ #include <cassert>
++#include <numeric>
+ #include <stdexcept>
+ TRAJOPT_IGNORE_WARNINGS_POP
+ 
+@@ -37,15 +38,17 @@ namespace trajopt_ifopt
+ JointAccelConstraint::JointAccelConstraint(const Eigen::VectorXd& targets,
+                                            const std::vector<std::shared_ptr<const Var>>& position_vars,
+                                            const Eigen::VectorXd& coeffs,
+-                                           std::string name)
+-  : JointAccelConstraint(toBounds(targets, targets), position_vars, coeffs, std::move(name))
++                                           std::string name,
++                                           RangeBoundHandling range_bound_handling)
++  : JointAccelConstraint(toBounds(targets, targets), position_vars, coeffs, std::move(name), range_bound_handling)
+ {
+ }
+ 
+ JointAccelConstraint::JointAccelConstraint(const std::vector<Bounds>& bounds,
+                                            const std::vector<std::shared_ptr<const Var>>& position_vars,
+                                            const Eigen::VectorXd& coeffs,
+-                                           std::string name)
++                                           std::string name,
++                                           RangeBoundHandling range_bound_handling)
+   : ConstraintSet(std::move(name),
+                   static_cast<int>(bounds.size()) * (static_cast<int>(position_vars.size()) - DIFFERENCE_ORDER))
+   , n_dof_(static_cast<long>(bounds.size()))
+@@ -83,12 +86,24 @@ JointAccelConstraint::JointAccelConstraint(const std::vector<Bounds>& bounds,
+   bounds_.reserve(static_cast<std::size_t>(rows_));
+   for (Eigen::Index block = 0; block < (n_vars_ - DIFFERENCE_ORDER); ++block)
+     bounds_.insert(bounds_.end(), bounds.begin(), bounds.end());
++
++  if (range_bound_handling == RangeBoundHandling::kSplitToTwoInequalities)
++  {
++    row_map_ = splitRangeBounds(bounds_, coeffs_);
++    rows_ = static_cast<int>(row_map_.size());
++    non_zeros_ = (DIFFERENCE_ORDER + 1) * static_cast<Eigen::Index>(rows_);
++  }
++  else
++  {
++    row_map_.resize(bounds_.size());
++    std::iota(row_map_.begin(), row_map_.end(), Eigen::Index{ 0 });
++  }
+ }
+ 
+ Eigen::VectorXd JointAccelConstraint::getValues() const
+ {
+   const std::size_t n = position_vars_.size();
+-  Eigen::VectorXd acceleration(rows_);
++  Eigen::VectorXd acceleration(n_dof_ * (n_vars_ - DIFFERENCE_ORDER));
+ 
+   // Forward difference: a_i = q_{i+2} - 2*q_{i+1} + q_i
+   for (std::size_t i = 0; i < n - DIFFERENCE_ORDER; ++i)
+@@ -100,7 +115,7 @@ Eigen::VectorXd JointAccelConstraint::getValues() const
+     acceleration.segment(static_cast<Eigen::Index>(i) * n_dof_, n_dof_) = q2 - 2.0 * q1 + q0;
+   }
+ 
+-  return acceleration;
++  return acceleration(row_map_);
+ }
+ 
+ Eigen::VectorXd JointAccelConstraint::getCoefficients() const { return coeffs_; }
+@@ -110,8 +125,9 @@ std::vector<Bounds> JointAccelConstraint::getBounds() const { return bounds_; }
+ 
+ Jacobian JointAccelConstraint::getJacobian() const
+ {
+-  Jacobian jac(rows_, variables_->getRows());
+-  jac.reserve(non_zeros_);
++  // The Jacobian of the difference rows, before any range bound split
++  Jacobian jac(n_dof_ * (n_vars_ - DIFFERENCE_ORDER), variables_->getRows());
++  jac.reserve((DIFFERENCE_ORDER + 1) * n_dof_ * (n_vars_ - DIFFERENCE_ORDER));
+ 
+   const std::size_t n = position_vars_.size();
+   for (std::size_t i = 0; i < n - DIFFERENCE_ORDER; ++i)
+@@ -134,7 +150,7 @@ Jacobian JointAccelConstraint::getJacobian() const
+   }
+ 
+   jac.finalize();  // NOLINT
+-  return jac;
++  return selectRows(jac, row_map_);
+ }
+ 
+ }  // namespace trajopt_ifopt
+diff --git a/trajopt_ifopt/src/constraints/joint_jerk_constraint.cpp b/trajopt_ifopt/src/constraints/joint_jerk_constraint.cpp
+index 67f5d298..2a55b056 100644
+--- a/trajopt_ifopt/src/constraints/joint_jerk_constraint.cpp
++++ b/trajopt_ifopt/src/constraints/joint_jerk_constraint.cpp
+@@ -29,6 +29,7 @@
+ 
+ TRAJOPT_IGNORE_WARNINGS_PUSH
+ #include <cassert>
++#include <numeric>
+ #include <stdexcept>
+ TRAJOPT_IGNORE_WARNINGS_POP
+ 
+@@ -37,15 +38,17 @@ namespace trajopt_ifopt
+ JointJerkConstraint::JointJerkConstraint(const Eigen::VectorXd& targets,
+                                          const std::vector<std::shared_ptr<const Var>>& position_vars,
+                                          const Eigen::VectorXd& coeffs,
+-                                         std::string name)
+-  : JointJerkConstraint(toBounds(targets, targets), position_vars, coeffs, std::move(name))
++                                         std::string name,
++                                         RangeBoundHandling range_bound_handling)
++  : JointJerkConstraint(toBounds(targets, targets), position_vars, coeffs, std::move(name), range_bound_handling)
+ {
+ }
+ 
+ JointJerkConstraint::JointJerkConstraint(const std::vector<Bounds>& bounds,
+                                          const std::vector<std::shared_ptr<const Var>>& position_vars,
+                                          const Eigen::VectorXd& coeffs,
+-                                         std::string name)
++                                         std::string name,
++                                         RangeBoundHandling range_bound_handling)
+   : ConstraintSet(std::move(name),
+                   static_cast<int>(bounds.size()) * (static_cast<int>(position_vars.size()) - DIFFERENCE_ORDER))
+   , n_dof_(static_cast<long>(bounds.size()))
+@@ -83,12 +86,24 @@ JointJerkConstraint::JointJerkConstraint(const std::vector<Bounds>& bounds,
+   bounds_.reserve(static_cast<std::size_t>(rows_));
+   for (Eigen::Index block = 0; block < (n_vars_ - DIFFERENCE_ORDER); ++block)
+     bounds_.insert(bounds_.end(), bounds.begin(), bounds.end());
++
++  if (range_bound_handling == RangeBoundHandling::kSplitToTwoInequalities)
++  {
++    row_map_ = splitRangeBounds(bounds_, coeffs_);
++    rows_ = static_cast<int>(row_map_.size());
++    non_zeros_ = (DIFFERENCE_ORDER + 1) * static_cast<Eigen::Index>(rows_);
++  }
++  else
++  {
++    row_map_.resize(bounds_.size());
++    std::iota(row_map_.begin(), row_map_.end(), Eigen::Index{ 0 });
++  }
+ }
+ 
+ Eigen::VectorXd JointJerkConstraint::getValues() const
+ {
+   const std::size_t n = position_vars_.size();
+-  Eigen::VectorXd jerk(rows_);
++  Eigen::VectorXd jerk(n_dof_ * (n_vars_ - DIFFERENCE_ORDER));
+ 
+   // Forward difference: j_i = -q_i + 3*q_{i+1} - 3*q_{i+2} + q_{i+3}
+   for (std::size_t i = 0; i < n - DIFFERENCE_ORDER; ++i)
+@@ -101,7 +116,7 @@ Eigen::VectorXd JointJerkConstraint::getValues() const
+     jerk.segment(static_cast<Eigen::Index>(i) * n_dof_, n_dof_) = -q0 + 3.0 * q1 - 3.0 * q2 + q3;
+   }
+ 
+-  return jerk;
++  return jerk(row_map_);
+ }
+ 
+ Eigen::VectorXd JointJerkConstraint::getCoefficients() const { return coeffs_; }
+@@ -111,8 +126,9 @@ std::vector<Bounds> JointJerkConstraint::getBounds() const { return bounds_; }
+ 
+ Jacobian JointJerkConstraint::getJacobian() const
+ {
+-  Jacobian jac(rows_, variables_->getRows());
+-  jac.reserve(non_zeros_);
++  // The Jacobian of the difference rows, before any range bound split
++  Jacobian jac(n_dof_ * (n_vars_ - DIFFERENCE_ORDER), variables_->getRows());
++  jac.reserve((DIFFERENCE_ORDER + 1) * n_dof_ * (n_vars_ - DIFFERENCE_ORDER));
+ 
+   const std::size_t n = position_vars_.size();
+ 
+@@ -138,7 +154,7 @@ Jacobian JointJerkConstraint::getJacobian() const
+   }
+ 
+   jac.finalize();  // NOLINT
+-  return jac;
++  return selectRows(jac, row_map_);
+ }
+ 
+ }  // namespace trajopt_ifopt
+diff --git a/trajopt_ifopt/src/constraints/joint_velocity_constraint.cpp b/trajopt_ifopt/src/constraints/joint_velocity_constraint.cpp
+index 55b01b92..46beb7ed 100644
+--- a/trajopt_ifopt/src/constraints/joint_velocity_constraint.cpp
++++ b/trajopt_ifopt/src/constraints/joint_velocity_constraint.cpp
+@@ -29,6 +29,7 @@
+ 
+ TRAJOPT_IGNORE_WARNINGS_PUSH
+ #include <cassert>
++#include <numeric>
+ #include <stdexcept>
+ TRAJOPT_IGNORE_WARNINGS_POP
+ 
+@@ -37,15 +38,17 @@ namespace trajopt_ifopt
+ JointVelConstraint::JointVelConstraint(const Eigen::VectorXd& targets,
+                                        const std::vector<std::shared_ptr<const Var>>& position_vars,
+                                        const Eigen::VectorXd& coeffs,
+-                                       std::string name)
+-  : JointVelConstraint(toBounds(targets, targets), position_vars, coeffs, std::move(name))
++                                       std::string name,
++                                       RangeBoundHandling range_bound_handling)
++  : JointVelConstraint(toBounds(targets, targets), position_vars, coeffs, std::move(name), range_bound_handling)
+ {
+ }
+ 
+ JointVelConstraint::JointVelConstraint(const std::vector<Bounds>& bounds,
+                                        const std::vector<std::shared_ptr<const Var>>& position_vars,
+                                        const Eigen::VectorXd& coeffs,
+-                                       std::string name)
++                                       std::string name,
++                                       RangeBoundHandling range_bound_handling)
+   : ConstraintSet(std::move(name),
+                   static_cast<int>(bounds.size()) * (static_cast<int>(position_vars.size()) - DIFFERENCE_ORDER))
+   , n_dof_(static_cast<long>(bounds.size()))
+@@ -83,6 +86,18 @@ JointVelConstraint::JointVelConstraint(const std::vector<Bounds>& bounds,
+   bounds_.reserve(static_cast<std::size_t>(rows_));
+   for (Eigen::Index block = 0; block < (n_vars_ - DIFFERENCE_ORDER); ++block)
+     bounds_.insert(bounds_.end(), bounds.begin(), bounds.end());
++
++  if (range_bound_handling == RangeBoundHandling::kSplitToTwoInequalities)
++  {
++    row_map_ = splitRangeBounds(bounds_, coeffs_);
++    rows_ = static_cast<int>(row_map_.size());
++    non_zeros_ = (DIFFERENCE_ORDER + 1) * static_cast<Eigen::Index>(rows_);
++  }
++  else
++  {
++    row_map_.resize(bounds_.size());
++    std::iota(row_map_.begin(), row_map_.end(), Eigen::Index{ 0 });
++  }
+ }
+ 
+ Eigen::VectorXd JointVelConstraint::getValues() const
+@@ -98,7 +113,7 @@ Eigen::VectorXd JointVelConstraint::getValues() const
+   // Number of velocity segments (one less than number of position vars)
+   const Eigen::Index n_segments = n_vars_ - DIFFERENCE_ORDER;
+ 
+-  Eigen::VectorXd velocity(rows_);
++  Eigen::VectorXd velocity(n_dof_ * (n_vars_ - DIFFERENCE_ORDER));
+ 
+   for (Eigen::Index seg = 0; seg < n_segments; ++seg)
+   {
+@@ -110,7 +125,7 @@ Eigen::VectorXd JointVelConstraint::getValues() const
+     velocity.segment(seg * n_dof_, n_dof_) = (q1 - q0);
+   }
+ 
+-  return velocity;
++  return velocity(row_map_);
+ }
+ 
+ Eigen::VectorXd JointVelConstraint::getCoefficients() const { return coeffs_; }
+@@ -120,8 +135,9 @@ std::vector<Bounds> JointVelConstraint::getBounds() const { return bounds_; }
+ 
+ Jacobian JointVelConstraint::getJacobian() const
+ {
+-  Jacobian jac(rows_, variables_->getRows());
+-  jac.reserve(non_zeros_);
++  // The Jacobian of the difference rows, before any range bound split
++  Jacobian jac(n_dof_ * (n_vars_ - DIFFERENCE_ORDER), variables_->getRows());
++  jac.reserve((DIFFERENCE_ORDER + 1) * n_dof_ * (n_vars_ - DIFFERENCE_ORDER));
+ 
+   for (Eigen::Index seg = 0; seg < (n_vars_ - DIFFERENCE_ORDER); ++seg)
+   {
+@@ -142,7 +158,7 @@ Jacobian JointVelConstraint::getJacobian() const
+   }
+ 
+   jac.finalize();  // NOLINT
+-  return jac;
++  return selectRows(jac, row_map_);
+ }
+ 
+ }  // namespace trajopt_ifopt
+diff --git a/trajopt_ifopt/src/utils/ifopt_utils.cpp b/trajopt_ifopt/src/utils/ifopt_utils.cpp
+index d1dd657c..72e7bb59 100644
+--- a/trajopt_ifopt/src/utils/ifopt_utils.cpp
++++ b/trajopt_ifopt/src/utils/ifopt_utils.cpp
+@@ -29,6 +29,8 @@
+ #include <trajopt_ifopt/utils/ifopt_utils.h>
+ 
+ #include <cassert>
++#include <cmath>
++#include <vector>
+ 
+ namespace trajopt_ifopt
+ {
+@@ -56,6 +58,53 @@ std::vector<Bounds> toBounds(const Eigen::Ref<const Eigen::VectorXd>& lower_limi
+   return bounds;
+ }
+ 
++std::vector<Eigen::Index> splitRangeBounds(std::vector<Bounds>& bounds, Eigen::VectorXd& coeffs)
++{
++  assert(static_cast<Eigen::Index>(bounds.size()) == coeffs.size());  // NOLINT
++
++  std::vector<Bounds> split_bounds;
++  std::vector<double> split_coeffs;
++  std::vector<Eigen::Index> row_map;
++  split_bounds.reserve(bounds.size());
++  split_coeffs.reserve(bounds.size());
++  row_map.reserve(bounds.size());
++  for (std::size_t i = 0; i < bounds.size(); ++i)
++  {
++    const auto row = static_cast<Eigen::Index>(i);
++    if (bounds[i].getType() == BoundsType::kRangeBound)
++    {
++      split_bounds.emplace_back(bounds[i].getLower(), double(INFINITY));
++      split_bounds.emplace_back(-double(INFINITY), bounds[i].getUpper());
++      split_coeffs.insert(split_coeffs.end(), 2, coeffs(row));
++      row_map.insert(row_map.end(), 2, row);
++    }
++    else
++    {
++      split_bounds.push_back(bounds[i]);
++      split_coeffs.push_back(coeffs(row));
++      row_map.push_back(row);
++    }
++  }
++
++  bounds = std::move(split_bounds);
++  coeffs = Eigen::Map<Eigen::VectorXd>(split_coeffs.data(), static_cast<Eigen::Index>(split_coeffs.size()));
++  return row_map;
++}
++
++Jacobian selectRows(const Jacobian& jac, const std::vector<Eigen::Index>& rows)
++{
++  Jacobian selected(static_cast<Eigen::Index>(rows.size()), jac.cols());
++  for (std::size_t i = 0; i < rows.size(); ++i)
++  {
++    const auto row = static_cast<Eigen::Index>(i);
++    selected.startVec(row);
++    for (Jacobian::InnerIterator it(jac, rows[i]); it; ++it)
++      selected.insertBack(row, it.col()) = it.value();
++  }
++  selected.finalize();  // NOLINT
++  return selected;
++}
++
+ std::vector<Eigen::VectorXd> interpolate(const Eigen::Ref<const Eigen::VectorXd>& start,
+                                          const Eigen::Ref<const Eigen::VectorXd>& end,
+                                          Eigen::Index steps)
+diff --git a/trajopt_ifopt/test/joint_terms_unit.cpp b/trajopt_ifopt/test/joint_terms_unit.cpp
+index 0ca0b723..702a32e5 100644
+--- a/trajopt_ifopt/test/joint_terms_unit.cpp
++++ b/trajopt_ifopt/test/joint_terms_unit.cpp
+@@ -77,8 +77,10 @@ void expectOneTargetAndWeightPerRow(const std::vector<std::shared_ptr<const Var>
+ }
+ 
+ /**
+- * @brief Check that the bounds constructor repeats the per-joint bounds for every row block
+- * @details The rows, values and Jacobian match the targets constructor, which only differs in its bounds.
++ * @brief Check the bounds constructor with and without splitting the range bounds
++ * @details The per-joint bounds hold an equality, a one-sided and a range bound and repeat for every row block. Kept
++ * as is, every row matches the targets constructor apart from its bounds. Split, the range row of each block becomes
++ * a lower-bound row and an upper-bound row, and values, Jacobian rows and coefficients follow the split.
+  */
+ template <typename ConstraintT>
+ void expectBoundsPerRow(const std::vector<std::shared_ptr<const Var>>& position_vars,
+@@ -86,32 +88,73 @@ void expectBoundsPerRow(const std::vector<std::shared_ptr<const Var>>& position_
+ {
+   const Eigen::Index n_dof = position_vars.front()->size();
+   ASSERT_EQ(n_dof, 3);
+-  // An equality, a one-sided and a range bound
+-  const std::vector<Bounds> bounds{ Bounds(0.25, 0.25),
+-                                    Bounds(-std::numeric_limits<double>::infinity(), 1.5),
+-                                    Bounds(-2.0, 3.0) };
++  constexpr double inf = std::numeric_limits<double>::infinity();
++  const std::vector<Bounds> bounds{ Bounds(0.25, 0.25), Bounds(-inf, 1.5), Bounds(-2.0, 3.0) };
+   const Eigen::VectorXd coeffs = Eigen::Vector3d(1, 2, 3);
+ 
+-  ConstraintT from_bounds(bounds, position_vars, coeffs, "from_bounds");
+   ConstraintT from_targets(Eigen::VectorXd::Zero(n_dof), position_vars, coeffs, "from_targets");
+-  from_bounds.linkWithVariables(variables);
++  ConstraintT kept(bounds, position_vars, coeffs, "kept", RangeBoundHandling::kKeepAsIs);
++  ConstraintT split(bounds, position_vars, coeffs, "split");
+   from_targets.linkWithVariables(variables);
++  kept.linkWithVariables(variables);
++  split.linkWithVariables(variables);
+ 
+-  EXPECT_EQ(from_bounds.getName(), "from_bounds");
+-  ASSERT_EQ(from_bounds.getRows(), from_targets.getRows());
+-  EXPECT_TRUE(from_bounds.getCoefficients().isApprox(from_targets.getCoefficients()));
++  const Eigen::Index n_blocks = from_targets.getRows() / n_dof;
++  const Eigen::VectorXd values = from_targets.getValues();
++  const Eigen::MatrixXd jac = from_targets.getJacobian().toDense();
+ 
+-  const std::vector<Bounds> row_bounds = from_bounds.getBounds();
+-  ASSERT_EQ(row_bounds.size(), static_cast<std::size_t>(from_bounds.getRows()));
+-  for (std::size_t row = 0; row < row_bounds.size(); ++row)
++  // Kept as is: one row per joint and block
+   {
+-    const Bounds& expected = bounds[row % static_cast<std::size_t>(n_dof)];
+-    EXPECT_EQ(row_bounds[row].getLower(), expected.getLower());
+-    EXPECT_EQ(row_bounds[row].getUpper(), expected.getUpper());
++    EXPECT_EQ(kept.getName(), "kept");
++    ASSERT_EQ(kept.getRows(), from_targets.getRows());
++    EXPECT_TRUE(kept.getCoefficients().isApprox(from_targets.getCoefficients()));
++    const std::vector<Bounds> row_bounds = kept.getBounds();
++    ASSERT_EQ(row_bounds.size(), static_cast<std::size_t>(kept.getRows()));
++    for (std::size_t row = 0; row < row_bounds.size(); ++row)
++    {
++      const Bounds& expected = bounds[row % static_cast<std::size_t>(n_dof)];
++      EXPECT_EQ(row_bounds[row].getLower(), expected.getLower());
++      EXPECT_EQ(row_bounds[row].getUpper(), expected.getUpper());
++    }
++    EXPECT_TRUE(kept.getValues().isApprox(values));
++    EXPECT_TRUE(kept.getJacobian().toDense().isApprox(jac));
+   }
+ 
+-  EXPECT_TRUE(from_bounds.getValues().isApprox(from_targets.getValues()));
+-  EXPECT_TRUE(from_bounds.getJacobian().toDense().isApprox(from_targets.getJacobian().toDense()));
++  // Split: per block the equality row, the one-sided row, then the range as a lower row and an upper row
++  {
++    const std::vector<Eigen::Index> block_joint{ 0, 1, 2, 2 };
++    const std::vector<Bounds> block_bounds{
++      Bounds(0.25, 0.25), Bounds(-inf, 1.5), Bounds(-2.0, inf), Bounds(-inf, 3.0)
++    };
++    const auto per_block = static_cast<Eigen::Index>(block_joint.size());
++
++    ASSERT_EQ(split.getRows(), n_blocks * per_block);
++    const std::vector<Bounds> row_bounds = split.getBounds();
++    const Eigen::VectorXd split_coeffs = split.getCoefficients();
++    const Eigen::VectorXd split_values = split.getValues();
++    const Eigen::MatrixXd split_jac = split.getJacobian().toDense();
++    ASSERT_EQ(row_bounds.size(), static_cast<std::size_t>(split.getRows()));
++    ASSERT_EQ(split_coeffs.size(), split.getRows());
++    ASSERT_EQ(split_values.size(), split.getRows());
++    ASSERT_EQ(split_jac.rows(), split.getRows());
++    ASSERT_EQ(split_jac.cols(), jac.cols());
++
++    for (Eigen::Index block = 0; block < n_blocks; ++block)
++    {
++      for (Eigen::Index r = 0; r < per_block; ++r)
++      {
++        const Eigen::Index row = (block * per_block) + r;
++        const Eigen::Index joint = block_joint[static_cast<std::size_t>(r)];
++        const Eigen::Index source = (block * n_dof) + joint;
++        const Bounds& expected = block_bounds[static_cast<std::size_t>(r)];
++        EXPECT_EQ(row_bounds[static_cast<std::size_t>(row)].getLower(), expected.getLower());
++        EXPECT_EQ(row_bounds[static_cast<std::size_t>(row)].getUpper(), expected.getUpper());
++        EXPECT_DOUBLE_EQ(split_coeffs(row), coeffs(joint));
++        EXPECT_DOUBLE_EQ(split_values(row), values(source));
++        EXPECT_TRUE(split_jac.row(row).isApprox(jac.row(source)));
++      }
++    }
++  }
+ }
+ 
+ /** @brief Tests the Joint Position Constraint */
+diff --git a/trajopt_optimizers/trajopt_sqp/test/joint_velocity_optimization_unit.cpp b/trajopt_optimizers/trajopt_sqp/test/joint_velocity_optimization_unit.cpp
+index 13e5845b..92ad8646 100644
+--- a/trajopt_optimizers/trajopt_sqp/test/joint_velocity_optimization_unit.cpp
++++ b/trajopt_optimizers/trajopt_sqp/test/joint_velocity_optimization_unit.cpp
+@@ -141,6 +141,79 @@ TEST_F(VelocityConstraintOptimization, velocity_constraint_optimization_trajopt_
+   runVelocityConstraintOptimizationTest<trajopt_sqp::TrajOptQPProblem>();
+ }
+ 
++/**
++ * @brief A symmetric velocity band (-v <= dq <= v) is a range bound. The bounds constructor splits it into two
++ * one-sided rows, which TrajOptQPProblem accepts, and the solution stays inside the band.
++ */
++TEST_F(VelocityConstraintOptimization, velocity_band_constraint_trajopt_problem)  // NOLINT
++{
++  TESSERACT_LOG_DEBUG("VelocityConstraintOptimization, velocity_band_constraint_trajopt_problem");
++
++  auto qp_solver = std::make_shared<trajopt_sqp::OSQPEigenSolver>();
++  trajopt_sqp::TrustRegionSQPSolver solver(qp_solver);
++  qp_solver->solver_->settings()->setVerbosity(DEBUG);
++  qp_solver->solver_->settings()->setAbsoluteTolerance(1e-6);
++  qp_solver->solver_->settings()->setRelativeTolerance(1e-6);
++  qp_solver->solver_->settings()->setMaxIteration(8192);
++  qp_solver->solver_->settings()->setPolish(true);
++
++  // 1) Four states of two joints, all starting at zero
++  constexpr Eigen::Index n_dof = 2;
++  constexpr int n_states = 4;
++  std::vector<std::unique_ptr<trajopt_ifopt::Node>> nodes;
++  std::vector<std::shared_ptr<const trajopt_ifopt::Var>> vars;
++  const std::vector<std::string> joint_names{ "a", "b" };
++  const auto var_bounds = std::vector<trajopt_ifopt::Bounds>(n_dof, trajopt_ifopt::NoBound);
++  for (int ind = 0; ind < n_states; ind++)
++  {
++    auto node = std::make_unique<trajopt_ifopt::Node>("Joint_Position_" + std::to_string(ind));
++    vars.push_back(node->addVar("position", joint_names, Eigen::VectorXd::Zero(n_dof), var_bounds));
++    nodes.push_back(std::move(node));
++  }
++  auto variables = std::make_shared<trajopt_ifopt::NodesVariables>("joint_trajectory", std::move(nodes));
++  auto qp_problem = std::make_shared<trajopt_sqp::TrajOptQPProblem>(variables);
++
++  // 2) Start fixed at zero
++  const Eigen::VectorXd coeffs = Eigen::VectorXd::Constant(n_dof, 5);
++  qp_problem->addConstraintSet(std::make_shared<trajopt_ifopt::JointPosConstraint>(
++      Eigen::VectorXd::Zero(n_dof), vars.front(), coeffs, "StartPosition"));
++
++  // 3) Velocity band: each step may move each joint by at most v
++  const double v = 1.0;
++  const std::vector<trajopt_ifopt::Bounds> band(n_dof, trajopt_ifopt::Bounds(-v, v));
++  auto vel_band = std::make_shared<trajopt_ifopt::JointVelConstraint>(band, vars, Eigen::VectorXd(), "VelocityBand");
++  EXPECT_EQ(vel_band->getRows(), 2 * n_dof * (n_states - 1));
++  qp_problem->addConstraintSet(vel_band);
++
++  // 4) Pull the last state beyond the band's reach: joint a up, joint b down
++  const Eigen::Vector2d end_target(10, -10);
++  qp_problem->addCostSet(
++      std::make_shared<trajopt_ifopt::JointPosConstraint>(end_target, vars.back(), coeffs, "EndPosition"),
++      trajopt_sqp::CostPenaltyType::kSquared);
++
++  EXPECT_NO_THROW(qp_problem->setup());  // NOLINT
++
++  // 5) Solve
++  solver.verbose = DEBUG;
++  solver.solve(qp_problem);
++  EXPECT_EQ(solver.getStatus(), trajopt_sqp::SQPStatus::kConverged);
++  const Eigen::VectorXd x = qp_problem->getVariableValues();
++
++  // Every step stays in the band, and the band is what stops the last state short of its target
++  constexpr double tol = 1e-4;
++  for (int step = 0; step < n_states - 1; ++step)
++  {
++    const Eigen::VectorXd dq = x.segment((step + 1) * n_dof, n_dof) - x.segment(step * n_dof, n_dof);
++    for (Eigen::Index k = 0; k < n_dof; ++k)
++    {
++      EXPECT_LE(dq(k), v + tol);
++      EXPECT_GE(dq(k), -v - tol);
++    }
++  }
++  EXPECT_NEAR(x((n_states - 1) * n_dof), (n_states - 1) * v, tol);
++  EXPECT_NEAR(x(((n_states - 1) * n_dof) + 1), -(n_states - 1) * v, tol);
++}
++
+ ////////////////////////////////////////////////////////////////////
+ 
+ int main(int argc, char** argv)

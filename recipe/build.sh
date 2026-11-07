@@ -5,6 +5,10 @@ set -e
 mkdir -p src
 tar xf source.tar.gz --strip-components=1 -C src
 
+for p in "$RECIPE_DIR"/patches/*.patch; do
+  patch -p1 --forward --no-backup-if-mismatch -d src -i "$p"
+done
+
 mv src/trajopt_optimizers/trajopt_sqp src/trajopt_sqp
 
 # Flags as trajopt_ext/piqp. find_package(piqp) in trajopt_sco and trajopt_sqp finds this install.

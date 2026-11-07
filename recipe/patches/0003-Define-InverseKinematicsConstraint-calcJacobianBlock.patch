@@ -1,0 +1,116 @@
+From 83949695c14f3e64c4841cbe2a9838c38796deb4 Mon Sep 17 00:00:00 2001
+From: Jelle Feringa <jelleferinga@gmail.com>
+Date: Sat, 7 Nov 2026 14:47:58 +0100
+Subject: [PATCH 3/4] Define InverseKinematicsConstraint::calcJacobianBlock
+
+It was declared but never defined. getJacobian() now fills its Jacobian
+through it. The declaration takes (jac_block, joint_vals) like the other
+constraints; it could never be linked, so no caller depends on the old order.
+
+Closes #626
+---
+ .../inverse_kinematics_constraint.h           |  5 +++-
+ .../inverse_kinematics_constraint.cpp         | 22 ++++++++++++-----
+ .../inverse_kinematics_constraint_unit.cpp    | 24 +++++++++++++++++++
+ 3 files changed, 44 insertions(+), 7 deletions(-)
+
+diff --git a/trajopt_ifopt/include/trajopt_ifopt/constraints/inverse_kinematics_constraint.h b/trajopt_ifopt/include/trajopt_ifopt/constraints/inverse_kinematics_constraint.h
+index e360b6cf..90ba3a92 100644
+--- a/trajopt_ifopt/include/trajopt_ifopt/constraints/inverse_kinematics_constraint.h
++++ b/trajopt_ifopt/include/trajopt_ifopt/constraints/inverse_kinematics_constraint.h
+@@ -110,9 +110,12 @@ public:
+ 
+   /**
+    * @brief Fills the jacobian block associated with the constraint
++   * @details The IK solution is treated as constant, so the block is -1 on each joint of the constraint variable for
++   * any joint values.
+    * @param jac_block Block of the overall jacobian associated with these constraints
++   * @param joint_vals Joint values of the constraint variable (size n_dof_)
+    */
+-  void calcJacobianBlock(const Eigen::Ref<const Eigen::VectorXd>& joint_vals, Jacobian& jac_block) const;
++  void calcJacobianBlock(Jacobian& jac_block, const Eigen::Ref<const Eigen::VectorXd>& joint_vals) const;
+ 
+   /** @brief Get the jacobian */
+   Jacobian getJacobian() const override;
+diff --git a/trajopt_ifopt/src/constraints/inverse_kinematics_constraint.cpp b/trajopt_ifopt/src/constraints/inverse_kinematics_constraint.cpp
+index 2151e415..e94e33e4 100644
+--- a/trajopt_ifopt/src/constraints/inverse_kinematics_constraint.cpp
++++ b/trajopt_ifopt/src/constraints/inverse_kinematics_constraint.cpp
+@@ -31,6 +31,7 @@ TRAJOPT_IGNORE_WARNINGS_PUSH
+ #include <tesseract/common/types.h>
+ #include <tesseract/common/logging.h>
+ #include <cassert>
++#include <stdexcept>
+ TRAJOPT_IGNORE_WARNINGS_POP
+ 
+ namespace trajopt_ifopt
+@@ -111,19 +112,28 @@ void InverseKinematicsConstraint::setBounds(const std::vector<Bounds>& bounds)
+   bounds_ = bounds;
+ }
+ 
+-Jacobian InverseKinematicsConstraint::getJacobian() const
++void InverseKinematicsConstraint::calcJacobianBlock(Jacobian& jac_block,
++                                                    const Eigen::Ref<const Eigen::VectorXd>& joint_vals) const
+ {
+-  Jacobian jac(rows_, variables_->getRows());
+-  jac.reserve(non_zeros_);
++  if (joint_vals.size() != n_dof_)
++    throw std::runtime_error("InverseKinematicsConstraint, joint_vals must have one value per joint.");
+ 
+   // err = target - x =? derr/dx = -1
+   for (int j = 0; j < n_dof_; j++)  // NOLINT
+   {
+-    jac.startVec(j);
+-    jac.insertBack(j, constraint_var_->getIndex() + j) = -1;
++    jac_block.startVec(j);
++    jac_block.insertBack(j, constraint_var_->getIndex() + j) = -1;
+   }
+ 
+-  jac.finalize();  // NOLINT
++  jac_block.finalize();  // NOLINT
++}
++
++Jacobian InverseKinematicsConstraint::getJacobian() const
++{
++  Jacobian jac(rows_, variables_->getRows());
++  jac.reserve(non_zeros_);
++
++  calcJacobianBlock(jac, constraint_var_->value());
+   return jac;
+ }
+ 
+diff --git a/trajopt_ifopt/test/inverse_kinematics_constraint_unit.cpp b/trajopt_ifopt/test/inverse_kinematics_constraint_unit.cpp
+index ce0afed8..106c1318 100644
+--- a/trajopt_ifopt/test/inverse_kinematics_constraint_unit.cpp
++++ b/trajopt_ifopt/test/inverse_kinematics_constraint_unit.cpp
+@@ -170,6 +170,30 @@ TEST_F(InverseKinematicsConstraintUnit, GetSetBounds)  // NOLINT
+   }
+ }
+ 
++/**
++ * @brief calcJacobianBlock fills the same Jacobian as getJacobian at the linked values
++ */
++TEST_F(InverseKinematicsConstraintUnit, CalcJacobianBlock)  // NOLINT
++{
++  TESSERACT_LOG_DEBUG("InverseKinematicsConstraintUnit, CalcJacobianBlock");
++
++  Eigen::VectorXd joint_position = Eigen::VectorXd::LinSpaced(n_dof * 2, -0.5, 0.5);
++  nlp->setVariables(joint_position.data());
++
++  const Jacobian expected = constraint->getJacobian();
++  Jacobian jac_block(constraint->getRows(), nlp->getNumberOfOptimizationVariables());
++  constraint->calcJacobianBlock(jac_block, joint_position.head(n_dof));
++
++  ASSERT_EQ(jac_block.rows(), expected.rows());
++  ASSERT_EQ(jac_block.cols(), expected.cols());
++  EXPECT_EQ(jac_block.nonZeros(), expected.nonZeros());
++  EXPECT_TRUE(jac_block.toDense().isApprox(expected.toDense()));
++
++  Jacobian wrong_size(constraint->getRows(), nlp->getNumberOfOptimizationVariables());
++  EXPECT_THROW(constraint->calcJacobianBlock(wrong_size, Eigen::VectorXd::Zero(n_dof + 1)),  // NOLINT
++               std::runtime_error);
++}
++
+ ////////////////////////////////////////////////////////////////////
+ 
+ int main(int argc, char** argv)
