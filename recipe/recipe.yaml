@@ -24,7 +24,7 @@ source:
     file_name: piqp.tar.gz
 
 build:
-  number: 2
+  number: 3
 
 requirements:
   build:
@@ -99,7 +99,9 @@ requirements:
         - xorg-libx11
         - xorg-libxext
   run_exports:
-    - ${{ pin_subpackage('trajopt', upper_bound='x.x') }}
+    # Exact: dev builds of one version differ in class layout (patch 0004 adds row_map_ to the
+    # joint difference constraints), so a consumer runs only against the build it compiled with.
+    - ${{ pin_subpackage('trajopt', exact=True) }}
 
 tests:
   - package_contents:
